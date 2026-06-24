@@ -116,6 +116,8 @@ class EncounterEngine {
       }
     }
 
+    gs.applyDutyBonuses();
+    gs.resetSectorInteractions();
     gs.addLog(
         'Sector ${gs.sector - 1} cleared. Jump initiated — Sector ${gs.sector}.');
 

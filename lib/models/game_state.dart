@@ -116,6 +116,25 @@ extension AlienSpeciesInfo on AlienSpecies {
 
 // ─── Crew ─────────────────────────────────────────────────────────────────────
 
+enum CrewDuty { security, navigation, medical, engineering, intelligence }
+
+extension CrewDutyInfo on CrewDuty {
+  String get label => switch (this) {
+    CrewDuty.security     => 'Security',
+    CrewDuty.navigation   => 'Navigation',
+    CrewDuty.medical      => 'Medical',
+    CrewDuty.engineering  => 'Engineering',
+    CrewDuty.intelligence => 'Intelligence',
+  };
+  String get description => switch (this) {
+    CrewDuty.security     => 'Standing guard. Reduces tension by 3 per sector.',
+    CrewDuty.navigation   => 'Plotting safest routes. Saves 2 fuel per jump.',
+    CrewDuty.medical      => 'Monitoring crew health. Heals 4 trauma per sector.',
+    CrewDuty.engineering  => 'Maintaining systems. Repairs 3 hull per sector.',
+    CrewDuty.intelligence => 'Monitoring comms. Grants +5 alien knowledge per sector.',
+  };
+}
+
 class CrewMember {
   String name;
   String role;
@@ -131,6 +150,8 @@ class CrewMember {
   int alienKnowledge;
   bool isAlive;
   List<String> traumaEvents;
+  CrewDuty? assignedDuty;
+  bool interactedThisSector;
 
   CrewMember({
     required this.name,
@@ -146,17 +167,28 @@ class CrewMember {
     this.diplomaticSkill = 30,
     this.alienKnowledge = 10,
     this.isAlive = true,
+    this.assignedDuty,
+    this.interactedThisSector = false,
     List<String>? traumaEvents,
   }) : traumaEvents = traumaEvents ?? [];
 
   String get statusLabel =>
       status == CrewStatus.citizen ? 'CITIZEN' : 'CIVILIAN';
+
   String get loyaltyLabel {
     if (loyalty >= 80) return 'Devoted';
     if (loyalty >= 60) return 'Loyal';
     if (loyalty >= 40) return 'Uneasy';
     if (loyalty >= 20) return 'Resentful';
     return 'Mutinous';
+  }
+
+  String get talkLine {
+    if (loyalty >= 80) return '"Commander. I\'d follow you to the end of the sector."';
+    if (loyalty >= 60) return '"You can count on me, sir. Always."';
+    if (loyalty >= 40) return '"I\'m... doing my best out here. That\'s all I can say."';
+    if (loyalty >= 20) return '"What do you want? I\'m busy."';
+    return '"Don\'t push me right now, Commander."';
   }
 }
 
@@ -440,6 +472,32 @@ class GameState {
     if (missionLog.length > 40) missionLog.removeLast();
   }
 
+  void resetSectorInteractions() {
+    for (final c in crew) {
+      c.interactedThisSector = false;
+    }
+  }
+
+  // Apply passive duty bonuses for all living crew at sector end
+  void applyDutyBonuses() {
+    for (final c in crew.where((c) => c.isAlive && c.assignedDuty != null)) {
+      switch (c.assignedDuty!) {
+        case CrewDuty.security:
+          civilianTension = (civilianTension - 3).clamp(0, 100);
+        case CrewDuty.navigation:
+          fuel = (fuel + 2).clamp(0, maxFuel);
+        case CrewDuty.medical:
+          c.trauma = (c.trauma - 4).clamp(0, 100);
+        case CrewDuty.engineering:
+          hull = (hull + 3).clamp(0, maxHull);
+        case CrewDuty.intelligence:
+          for (final s in AlienSpecies.values) {
+            alienKnowledge[s] = ((alienKnowledge[s] ?? 0) + 5).clamp(0, 100);
+          }
+      }
+    }
+  }
+
   // ─── Route Management ────────────────────────────────────────────────────────
 
   static String connectionKey(String a, String b) {
@@ -455,28 +513,37 @@ class GameState {
     addLog('WARNING: Route ${a.toUpperCase()} — ${b.toUpperCase()} is now blocked.');
   }
 
-  // Spend salvage to attempt upgrade; returns true if successful
+  // Credit cost to upgrade from current level to next (tier 1=25, 2=50, 3=100)
+  static int upgradeCost(int currentLevel) => switch (currentLevel) {
+    0 => 25,
+    1 => 50,
+    _ => 100,
+  };
+
+  // Spend credits to purchase an upgrade; returns true if successful
   bool purchaseUpgrade(String upgradeKey) {
-    const cost = 10;
-    if (salvage < cost) return false;
-    salvage -= cost;
+    final lvl = switch (upgradeKey) {
+      'hull'     => upgrades.hullPlating,
+      'drive'    => upgrades.driveCore,
+      'med'      => upgrades.medBay,
+      'quarters' => upgrades.crewQuarters,
+      'weapons'  => upgrades.weaponsArray,
+      'research' => upgrades.researchTerminal,
+      _          => 3, // unknown key — block purchase
+    };
+    if (lvl >= 3) return false;
+    final cost = upgradeCost(lvl);
+    if (credits < cost) return false;
+    credits -= cost;
     switch (upgradeKey) {
-      case 'hull':
-        if (upgrades.hullPlating < 3) upgrades.hullPlating++;
-      case 'drive':
-        if (upgrades.driveCore < 3) upgrades.driveCore++;
-      case 'med':
-        if (upgrades.medBay < 3) upgrades.medBay++;
-      case 'quarters':
-        if (upgrades.crewQuarters < 3) upgrades.crewQuarters++;
-      case 'weapons':
-        if (upgrades.weaponsArray < 3) upgrades.weaponsArray++;
-      case 'research':
-        if (upgrades.researchTerminal < 3) upgrades.researchTerminal++;
-      default:
-        salvage += cost; // refund
-        return false;
+      case 'hull':     upgrades.hullPlating++;
+      case 'drive':    upgrades.driveCore++;
+      case 'med':      upgrades.medBay++;
+      case 'quarters': upgrades.crewQuarters++;
+      case 'weapons':  upgrades.weaponsArray++;
+      case 'research': upgrades.researchTerminal++;
     }
+    addLog('Research complete: ${upgrades.nameOf(['hull','drive','med','quarters','weapons','research'].indexOf(upgradeKey))} Mk.${lvl + 1}.');
     return true;
   }
 }

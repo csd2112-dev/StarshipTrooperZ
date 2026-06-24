@@ -4,6 +4,8 @@ import '../models/game_state.dart';
 import '../models/encounter.dart';
 import '../engine/encounter_engine.dart';
 import '../widgets/starfield_painter.dart';
+import '../widgets/crew_profile_dialog.dart';
+import '../widgets/research_dialog.dart';
 import 'title_screen.dart';
 
 class GameScreen extends StatefulWidget {
@@ -258,20 +260,38 @@ class _GameScreenState extends State<GameScreen> with SingleTickerProviderStateM
   // ─── Panels ──────────────────────────────────────────────────────────────────
 
   Widget _buildShipPanel() {
+    final hullPct = _gs.hull / _gs.maxHull;
+    final hullStatus = hullPct > 0.6 ? 'NOMINAL' : hullPct > 0.3 ? 'DAMAGED' : 'CRITICAL';
+    final fuelJumps = (_gs.fuel / 5).floor();
+
     return _Panel(
-      title: 'SHIP STATUS',
+      title: 'UES VEKTARA  •  SHIP STATUS',
       child: Column(children: [
-        _StatBar(label: 'HULL', value: _gs.hull, max: _gs.maxHull, color: _healthColor(_gs.hull, _gs.maxHull)),
-        _StatBar(label: 'FUEL', value: _gs.fuel, max: _gs.maxFuel, color: const Color(0xFF00AAFF)),
-        _StatBar(label: 'RATIONS', value: _gs.rations, max: _gs.maxRations, color: const Color(0xFFFFAA00)),
+        _StatBar(label: 'HULL', value: _gs.hull, max: _gs.maxHull,
+            color: _healthColor(_gs.hull, _gs.maxHull), note: hullStatus),
+        _StatBar(label: 'FUEL', value: _gs.fuel, max: _gs.maxFuel,
+            color: const Color(0xFF00AAFF), note: '~$fuelJumps jumps'),
+        _StatBar(label: 'OXYGEN', value: _gs.oxygen, max: _gs.maxOxygen,
+            color: const Color(0xFF44DDFF),
+            note: _gs.oxygen < 30 ? 'LOW' : 'OK'),
+        _StatBar(label: 'RATIONS', value: _gs.rations, max: _gs.maxRations,
+            color: const Color(0xFFFFAA00),
+            note: _gs.rations < 20 ? 'CRITICAL' : ''),
         _StatBar(label: 'AMMO', value: _gs.ammo, max: 100, color: const Color(0xFFCC88FF)),
         _StatBar(label: 'MEDICINE', value: _gs.medicine, max: 100, color: const Color(0xFF00DDCC)),
+        const SizedBox(height: 6),
+        Container(height: 1, color: Colors.white.withAlpha(20)),
+        const SizedBox(height: 6),
+        Row(children: [
+          Text('CREDITS', style: TextStyle(fontSize: 10, letterSpacing: 2, color: Colors.white.withAlpha(140))),
+          const Spacer(),
+          Text('₢${_gs.credits}', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Color(0xFFFFDD44))),
+        ]),
         const SizedBox(height: 4),
         Row(children: [
           Text('SALVAGE', style: TextStyle(fontSize: 10, letterSpacing: 2, color: Colors.white.withAlpha(140))),
           const Spacer(),
-          Text('${_gs.salvage}', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFFFFDD44))),
-          Text('  units', style: TextStyle(fontSize: 10, color: Colors.white.withAlpha(80))),
+          Text('${_gs.salvage} units', style: TextStyle(fontSize: 11, color: Colors.white.withAlpha(120))),
         ]),
       ]),
     );
@@ -343,36 +363,24 @@ class _GameScreenState extends State<GameScreen> with SingleTickerProviderStateM
   Widget _buildCrewPanel() {
     final alive = _gs.crew.where((c) => c.isAlive).toList();
     return _Panel(
-      title: 'CREW MANIFEST',
+      title: 'CREW MANIFEST  •  TAP TO INTERACT',
       child: Column(
         children: alive.map((c) {
           final isCitizen = c.status == CrewStatus.citizen;
           final sColor = isCitizen ? const Color(0xFF00AAFF) : const Color(0xFFFFAA00);
-          return Padding(
-            padding: const EdgeInsets.only(bottom: 12),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                Expanded(
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Text(c.name, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
-                    Text(c.role, style: TextStyle(fontSize: 10, color: Colors.white.withAlpha(120))),
-                  ]),
+          return _CrewCard(
+            member: c,
+            statusColor: sColor,
+            onTap: () {
+              showDialog(
+                context: context,
+                builder: (_) => CrewProfileDialog(
+                  member: c,
+                  gs: _gs,
+                  onChanged: () => setState(() {}),
                 ),
-                _Badge(label: c.statusLabel, color: sColor),
-              ]),
-              const SizedBox(height: 5),
-              Row(children: [
-                Expanded(child: _MiniBar(value: c.loyalty / 100, color: const Color(0xFF00FF88))),
-                const SizedBox(width: 8),
-                Text(c.loyaltyLabel, style: TextStyle(fontSize: 9, color: Colors.white.withAlpha(120))),
-              ]),
-              if (c.trauma > 20)
-                Padding(
-                  padding: const EdgeInsets.only(top: 3),
-                  child: Text('⚠ Trauma ${c.trauma}%',
-                      style: const TextStyle(fontSize: 9, color: Color(0xFFFF8844))),
-                ),
-            ]),
+              );
+            },
           );
         }).toList(),
       ),
@@ -406,59 +414,74 @@ class _GameScreenState extends State<GameScreen> with SingleTickerProviderStateM
   }
 
   Widget _buildUpgradesPanel() {
-    final keys = ['hull', 'drive', 'med', 'quarters', 'weapons', 'research'];
-    final names = ['Hull Plating', 'Drive Core', 'Med Bay', 'Quarters', 'Weapons', 'Research'];
+    final u = _gs.upgrades;
+    final names = ['Hull', 'Drive', 'Med Bay', 'Quarters', 'Weapons', 'Research'];
+    final levels = [u.hullPlating, u.driveCore, u.medBay, u.crewQuarters, u.weaponsArray, u.researchTerminal];
+    final totalUnlocked = levels.fold(0, (a, b) => a + b);
 
     return _Panel(
-      title: 'UPGRADES  •  10 salvage each',
+      title: 'RESEARCH & UPGRADES',
       child: Column(
-        children: List.generate(6, (i) {
-          final lvl = _gs.upgrades.levelOf(i);
-          final canBuy = _gs.salvage >= 10 && lvl < 3;
-          return Padding(
-            padding: const EdgeInsets.only(bottom: 8),
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Quick-glance pip summary
+          ...List.generate(6, (i) => Padding(
+            padding: const EdgeInsets.only(bottom: 6),
             child: Row(children: [
-              Expanded(child: Text(names[i], style: const TextStyle(fontSize: 11))),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: List.generate(3, (j) => Padding(
-                  padding: const EdgeInsets.only(left: 4),
-                  child: Container(
-                    width: 11,
-                    height: 11,
-                    decoration: BoxDecoration(
-                      color: j < lvl ? const Color(0xFF00FF88) : Colors.transparent,
-                      border: Border.all(
-                        color: j < lvl ? const Color(0xFF00FF88) : Colors.white.withAlpha(40),
-                      ),
-                    ),
-                  ),
-                )),
+              SizedBox(
+                width: 72,
+                child: Text(names[i],
+                    style: TextStyle(fontSize: 10, letterSpacing: 1, color: Colors.white.withAlpha(140))),
               ),
-              const SizedBox(width: 6),
-              GestureDetector(
-                onTap: canBuy
-                    ? () {
-                        final newLvl = lvl + 1;
-                        final ok = _gs.purchaseUpgrade(keys[i]);
-                        if (ok) setState(() => _gs.addLog('${names[i]} upgraded to Mk.$newLvl.'));
-                      }
-                    : null,
-                child: Opacity(
-                  opacity: canBuy ? 1.0 : 0.25,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 3),
-                    decoration: BoxDecoration(
-                      border: Border.all(color: const Color(0xFFFFDD44).withAlpha(160)),
+              ...List.generate(3, (j) => Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Container(
+                  width: 9,
+                  height: 9,
+                  decoration: BoxDecoration(
+                    color: j < levels[i] ? const Color(0xFF00DDCC) : Colors.transparent,
+                    border: Border.all(
+                      color: j < levels[i] ? const Color(0xFF00DDCC) : Colors.white.withAlpha(35),
                     ),
-                    child: const Text('BUY',
-                        style: TextStyle(fontSize: 8, letterSpacing: 1, color: Color(0xFFFFDD44))),
                   ),
                 ),
-              ),
+              )),
+              const Spacer(),
+              if (levels[i] == 3)
+                Text('MAX', style: TextStyle(fontSize: 8, letterSpacing: 2, color: const Color(0xFF00DDCC).withAlpha(160))),
             ]),
-          );
-        }),
+          )),
+          const SizedBox(height: 10),
+          Row(children: [
+            Text('₢${_gs.credits} available',
+                style: TextStyle(fontSize: 10, color: const Color(0xFFFFDD44).withAlpha(160))),
+            const Spacer(),
+            Text('$totalUnlocked / 18 researched',
+                style: TextStyle(fontSize: 9, color: Colors.white.withAlpha(60))),
+          ]),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton(
+              onPressed: () => showDialog(
+                context: context,
+                builder: (_) => ResearchDialog(
+                  gs: _gs,
+                  onChanged: () => setState(() {}),
+                ),
+              ),
+              style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: Color(0xFF00DDCC)),
+                shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+                padding: const EdgeInsets.symmetric(vertical: 10),
+              ),
+              child: const Text(
+                'OPEN RESEARCH TERMINAL',
+                style: TextStyle(fontSize: 10, letterSpacing: 2, color: Color(0xFF00DDCC), fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -952,7 +975,8 @@ class _StatBar extends StatelessWidget {
   final int value;
   final int max;
   final Color color;
-  const _StatBar({required this.label, required this.value, required this.max, required this.color});
+  final String note;
+  const _StatBar({required this.label, required this.value, required this.max, required this.color, this.note = ''});
 
   @override
   Widget build(BuildContext context) {
@@ -964,6 +988,9 @@ class _StatBar extends StatelessWidget {
           Row(children: [
             Text(label, style: TextStyle(fontSize: 10, letterSpacing: 2, color: Colors.white.withAlpha(140))),
             const Spacer(),
+            if (note.isNotEmpty)
+              Text(note, style: TextStyle(fontSize: 9, letterSpacing: 1, color: color.withAlpha(180))),
+            const SizedBox(width: 6),
             Text('$value / $max', style: TextStyle(fontSize: 10, color: Colors.white.withAlpha(100))),
           ]),
         if (label.isNotEmpty) const SizedBox(height: 4),
@@ -1047,6 +1074,73 @@ class _CrewCount extends StatelessWidget {
       Text('$count', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: color)),
       Text(label, style: TextStyle(fontSize: 8, letterSpacing: 1, color: Colors.white.withAlpha(100))),
     ]);
+  }
+}
+
+class _CrewCard extends StatefulWidget {
+  final CrewMember member;
+  final Color statusColor;
+  final VoidCallback onTap;
+  const _CrewCard({required this.member, required this.statusColor, required this.onTap});
+
+  @override
+  State<_CrewCard> createState() => _CrewCardState();
+}
+
+class _CrewCardState extends State<_CrewCard> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.member;
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          margin: const EdgeInsets.only(bottom: 10),
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            border: Border.all(
+              color: _hovered
+                  ? const Color(0xFF00FF88).withAlpha(160)
+                  : Colors.white.withAlpha(20),
+            ),
+            color: _hovered ? const Color(0xFF00FF88).withAlpha(10) : Colors.transparent,
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(c.name, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+                  Text(
+                    c.assignedDuty != null ? '${c.role}  •  ${c.assignedDuty!.label}' : c.role,
+                    style: TextStyle(fontSize: 10, color: Colors.white.withAlpha(120)),
+                  ),
+                ]),
+              ),
+              _Badge(label: c.statusLabel, color: widget.statusColor),
+              const SizedBox(width: 4),
+              Icon(Icons.chevron_right, size: 14, color: Colors.white.withAlpha(_hovered ? 160 : 60)),
+            ]),
+            const SizedBox(height: 6),
+            Row(children: [
+              Expanded(child: _MiniBar(value: c.loyalty / 100, color: const Color(0xFF00FF88))),
+              const SizedBox(width: 8),
+              Text(c.loyaltyLabel, style: TextStyle(fontSize: 9, color: Colors.white.withAlpha(120))),
+            ]),
+            if (c.trauma > 20)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text('⚠ Trauma ${c.trauma}%',
+                    style: const TextStyle(fontSize: 9, color: Color(0xFFFF8844))),
+              ),
+          ]),
+        ),
+      ),
+    );
   }
 }
 

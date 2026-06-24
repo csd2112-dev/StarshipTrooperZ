@@ -7,6 +7,8 @@ import '../engine/encounter_engine.dart';
 import '../widgets/starfield_painter.dart';
 import '../widgets/dialogue_box.dart';
 import '../widgets/shop_dialog.dart';
+import '../widgets/crew_profile_dialog.dart';
+import '../widgets/research_dialog.dart';
 import 'title_screen.dart';
 
 // ─── Screen ───────────────────────────────────────────────────────────────────
@@ -28,16 +30,17 @@ class _GalaxyMapScreenState extends State<GalaxyMapScreen>
   // Map animation
   late AnimationController _shipCtrl;
   late AnimationController _pulseCtrl;
-  Offset _shipFrom = kGalaxySystems.first.position;
-  Offset _shipTo = kGalaxySystems.first.position;
+  Offset _shipFrom = Offset.zero;
+  Offset _shipTo = Offset.zero;
   StarSystem? _pendingDest;
   bool _isMoving = false;
   Size _mapSize = Size.zero;
 
   // Map state
-  String _currentSystemId = 'vektara';
-  final Set<String> _visitedIds = {'vektara'};
+  late String _currentSystemId;
+  late Set<String> _visitedIds;
   final Set<String> _seenNpcIds = {};
+  String? _lastJumpFromId;
 
   // Dialogue
   List<DialogueLine>? _activeDialogue;
@@ -56,6 +59,21 @@ class _GalaxyMapScreenState extends State<GalaxyMapScreen>
   void initState() {
     super.initState();
     _gs = widget.gameState;
+
+    // Resolve starting node from the port chosen during character creation
+    final startId = switch (_gs.startingPort) {
+      StartingPort.vektaraStation  => 'vektara',
+      StartingPort.kavethTransit   => 'kaveth',
+      StartingPort.dustholdOutpost => 'drift',
+    };
+    _currentSystemId = startId;
+    _visitedIds = {startId};
+    final startSys = kGalaxySystems.firstWhere((s) => s.id == startId);
+    _shipFrom = startSys.position;
+    _shipTo   = startSys.position;
+
+    // Sync game-sector counter with the map starting sector (no resource cost)
+    if (_gs.sector < startSys.sector) _gs.sector = startSys.sector;
 
     _stars = generateStars(120, seed: 99);
     _starCtrl =
@@ -78,7 +96,7 @@ class _GalaxyMapScreenState extends State<GalaxyMapScreen>
 
     // Show starting NPC dialogue after first frame
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _tryShowDialogue('vektara', then: null);
+      _tryShowDialogue(startId, then: null);
     });
   }
 
@@ -113,8 +131,8 @@ class _GalaxyMapScreenState extends State<GalaxyMapScreen>
   }
 
   void _navigateTo(StarSystem dest) {
-    final current =
-        kGalaxySystems.firstWhere((s) => s.id == _currentSystemId);
+    final current = kGalaxySystems.firstWhere((s) => s.id == _currentSystemId);
+    _lastJumpFromId = _currentSystemId;
     _shipFrom = current.position;
     _shipTo = dest.position;
     _pendingDest = dest;
@@ -123,7 +141,6 @@ class _GalaxyMapScreenState extends State<GalaxyMapScreen>
   }
 
   void _onArrival(StarSystem dest) {
-    // Per-jump running costs (fuel, O2, rations)
     EncounterEngine.applyJumpCost(_gs);
 
     setState(() {
@@ -132,22 +149,56 @@ class _GalaxyMapScreenState extends State<GalaxyMapScreen>
       _isMoving = false;
     });
 
-    if (_gs.isGameOver) {
-      _showGameOver();
-      return;
-    }
+    if (_gs.isGameOver) { _showGameOver(); return; }
 
-    // Sector advance when entering a deeper region
     while (dest.sector > _gs.sector) {
       EncounterEngine.advanceSector(_gs);
-      if (_gs.isGameOver) {
-        setState(() {});
-        _showGameOver();
+      if (_gs.isGameOver) { setState(() {}); _showGameOver(); return; }
+    }
+
+    // Check for path events on the traversed connection
+    if (_lastJumpFromId != null) {
+      final connKey = ([_lastJumpFromId!, dest.id]..sort()).join('-');
+      final events = kPathEvents[connKey];
+      if (events != null && events.isNotEmpty) {
+        _showPathEvents(events, 0, then: () => _tryShowDialogue(dest.id, then: _checkForEncounter));
         return;
       }
     }
 
     _tryShowDialogue(dest.id, then: _checkForEncounter);
+  }
+
+  void _showPathEvents(List<PathEvent> events, int index, {required VoidCallback then}) {
+    if (index >= events.length) { then(); return; }
+    final ev = events[index];
+    // Apply event effects
+    setState(() {
+      _gs.hull    = (_gs.hull    + ev.hullDelta).clamp(0, _gs.maxHull);
+      _gs.fuel    = (_gs.fuel    + ev.fuelDelta).clamp(0, _gs.maxFuel);
+      _gs.rations = (_gs.rations + ev.rationsDelta).clamp(0, _gs.maxRations);
+      _gs.oxygen  = (_gs.oxygen  + ev.oxygenDelta).clamp(0, _gs.maxOxygen);
+      _gs.credits = (_gs.credits + ev.creditsDelta).clamp(0, 9999);
+      _gs.ammo    = (_gs.ammo    + ev.ammoDelta).clamp(0, 100);
+      _gs.medicine= (_gs.medicine+ ev.medicineDelta).clamp(0, 100);
+      for (final c in _gs.crew.where((c) => c.isAlive)) {
+        c.loyalty = (c.loyalty + ev.loyaltyDelta).clamp(0, 100);
+        c.fear    = (c.fear    + ev.fearDelta).clamp(0, 100);
+      }
+    });
+    if (_gs.isGameOver) { _showGameOver(); return; }
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _PathEventDialog(
+        event: ev,
+        onContinue: () {
+          Navigator.of(context).pop();
+          _showPathEvents(events, index + 1, then: then);
+        },
+      ),
+    );
   }
 
   void _openShop() {
@@ -475,6 +526,10 @@ class _GalaxyMapScreenState extends State<GalaxyMapScreen>
                   currentSystemId: _currentSystemId,
                   visitedIds: _visitedIds,
                   blockedConnections: _gs.blockedConnections,
+                  eventConnections: kPathEvents.entries
+                      .where((e) => e.value.isNotEmpty)
+                      .map((e) => e.key)
+                      .toSet(),
                   shipNormPos: _shipNormPos,
                   pulseValue: _pulseCtrl.value,
                 ),
@@ -588,55 +643,31 @@ class _GalaxyMapScreenState extends State<GalaxyMapScreen>
   // ─── HUD Panels ─────────────────────────────────────────────────────────────
 
   Widget _buildShipPanel() {
+    final hullPct = _gs.hull / _gs.maxHull;
+    final hullStatus = hullPct > 0.6 ? 'OK' : hullPct > 0.3 ? 'DMG' : 'CRIT';
+    final fuelJumps = (_gs.fuel / 5).floor();
     return _Panel(
-      title: 'SHIP STATUS',
+      title: 'UES VEKTARA  •  STATUS',
       child: Column(children: [
-        _StatBar(
-            label: 'HULL',
-            value: _gs.hull,
-            max: _gs.maxHull,
-            color: _healthColor(_gs.hull, _gs.maxHull)),
-        _StatBar(
-            label: 'FUEL',
-            value: _gs.fuel,
-            max: _gs.maxFuel,
-            color: const Color(0xFF00AAFF)),
-        _StatBar(
-            label: 'O2',
-            value: _gs.oxygen,
-            max: _gs.maxOxygen,
-            color: _healthColor(_gs.oxygen, _gs.maxOxygen)),
-        _StatBar(
-            label: 'RATIONS',
-            value: _gs.rations,
-            max: _gs.maxRations,
-            color: const Color(0xFFFFAA00)),
-        _StatBar(
-            label: 'AMMO',
-            value: _gs.ammo,
-            max: 100,
-            color: const Color(0xFFCC88FF)),
-        _StatBar(
-            label: 'MED',
-            value: _gs.medicine,
-            max: 100,
-            color: const Color(0xFF00DDCC)),
-        const SizedBox(height: 4),
+        _StatBar(label: 'HULL',    value: _gs.hull,    max: _gs.maxHull,    color: _healthColor(_gs.hull, _gs.maxHull),       note: hullStatus),
+        _StatBar(label: 'FUEL',    value: _gs.fuel,    max: _gs.maxFuel,    color: const Color(0xFF00AAFF),                   note: '~$fuelJumps j'),
+        _StatBar(label: 'O2',      value: _gs.oxygen,  max: _gs.maxOxygen,  color: _healthColor(_gs.oxygen, _gs.maxOxygen),   note: _gs.oxygen < 30 ? 'LOW' : ''),
+        _StatBar(label: 'RATIONS', value: _gs.rations, max: _gs.maxRations, color: const Color(0xFFFFAA00),                   note: _gs.rations < 20 ? 'CRIT' : ''),
+        _StatBar(label: 'AMMO',    value: _gs.ammo,    max: 100,            color: const Color(0xFFCC88FF)),
+        _StatBar(label: 'MED',     value: _gs.medicine,max: 100,            color: const Color(0xFF00DDCC)),
+        const SizedBox(height: 5),
+        Container(height: 1, color: Colors.white.withAlpha(18)),
+        const SizedBox(height: 5),
         Row(children: [
-          Text('SALVAGE',
-              style: TextStyle(
-                  fontSize: 9,
-                  letterSpacing: 2,
-                  color: Colors.white.withAlpha(140))),
+          Text('CREDITS', style: TextStyle(fontSize: 9, letterSpacing: 2, color: Colors.white.withAlpha(130))),
           const Spacer(),
-          Text('${_gs.salvage}',
-              style: const TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.bold,
-                  color: Color(0xFFFFDD44))),
-          Text('  u',
-              style:
-                  TextStyle(fontSize: 9, color: Colors.white.withAlpha(80))),
+          Text('₢${_gs.credits}', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFFFFDD44))),
+        ]),
+        const SizedBox(height: 3),
+        Row(children: [
+          Text('SALVAGE', style: TextStyle(fontSize: 9, letterSpacing: 2, color: Colors.white.withAlpha(130))),
+          const Spacer(),
+          Text('${_gs.salvage} u', style: TextStyle(fontSize: 11, color: Colors.white.withAlpha(110))),
         ]),
       ]),
     );
@@ -720,75 +751,61 @@ class _GalaxyMapScreenState extends State<GalaxyMapScreen>
   }
 
   Widget _buildUpgradesPanel() {
-    final keys = ['hull', 'drive', 'med', 'quarters', 'weapons', 'research'];
-    final names = [
-      'Hull Plating', 'Drive Core', 'Med Bay',
-      'Quarters', 'Weapons', 'Research'
-    ];
+    final u = _gs.upgrades;
+    final names = ['Hull', 'Drive', 'Med Bay', 'Quarters', 'Weapons', 'Research'];
+    final levels = [u.hullPlating, u.driveCore, u.medBay, u.crewQuarters, u.weaponsArray, u.researchTerminal];
+    final totalUnlocked = levels.fold(0, (a, b) => a + b);
     return _Panel(
-      title: 'UPGRADES  •  10 sal',
+      title: 'RESEARCH & UPGRADES',
       child: Column(
-        children: List.generate(6, (i) {
-          final lvl = _gs.upgrades.levelOf(i);
-          final canBuy = _gs.salvage >= 10 && lvl < 3;
-          return Padding(
-            padding: const EdgeInsets.only(bottom: 7),
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          ...List.generate(6, (i) => Padding(
+            padding: const EdgeInsets.only(bottom: 5),
             child: Row(children: [
-              Expanded(
-                  child:
-                      Text(names[i], style: const TextStyle(fontSize: 10))),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: List.generate(
-                    3,
-                    (j) => Padding(
-                          padding: const EdgeInsets.only(left: 3),
-                          child: Container(
-                            width: 9,
-                            height: 9,
-                            decoration: BoxDecoration(
-                              color: j < lvl
-                                  ? const Color(0xFF00FF88)
-                                  : Colors.transparent,
-                              border: Border.all(
-                                color: j < lvl
-                                    ? const Color(0xFF00FF88)
-                                    : Colors.white.withAlpha(40),
-                              ),
-                            ),
-                          ),
-                        )),
+              SizedBox(
+                width: 64,
+                child: Text(names[i], style: TextStyle(fontSize: 9, letterSpacing: 1, color: Colors.white.withAlpha(130))),
               ),
-              const SizedBox(width: 5),
-              GestureDetector(
-                onTap: canBuy
-                    ? () {
-                        final ok = _gs.purchaseUpgrade(keys[i]);
-                        if (ok) {
-                          setState(() =>
-                              _gs.addLog('${names[i]} upgraded.'));
-                        }
-                      }
-                    : null,
-                child: Opacity(
-                  opacity: canBuy ? 1.0 : 0.25,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 4, vertical: 2),
-                    decoration: BoxDecoration(
-                        border: Border.all(
-                            color: const Color(0xFFFFDD44).withAlpha(160))),
-                    child: const Text('BUY',
-                        style: TextStyle(
-                            fontSize: 7,
-                            letterSpacing: 1,
-                            color: Color(0xFFFFDD44))),
+              ...List.generate(3, (j) => Padding(
+                padding: const EdgeInsets.only(right: 3),
+                child: Container(
+                  width: 8, height: 8,
+                  decoration: BoxDecoration(
+                    color: j < levels[i] ? const Color(0xFF00DDCC) : Colors.transparent,
+                    border: Border.all(color: j < levels[i] ? const Color(0xFF00DDCC) : Colors.white.withAlpha(30)),
                   ),
                 ),
-              ),
+              )),
+              const Spacer(),
+              if (levels[i] == 3)
+                Text('MAX', style: TextStyle(fontSize: 7, letterSpacing: 1, color: const Color(0xFF00DDCC).withAlpha(140))),
             ]),
-          );
-        }),
+          )),
+          const SizedBox(height: 8),
+          Row(children: [
+            Text('₢${_gs.credits}', style: const TextStyle(fontSize: 9, color: Color(0xFFFFDD44))),
+            const Spacer(),
+            Text('$totalUnlocked/18', style: TextStyle(fontSize: 8, color: Colors.white.withAlpha(60))),
+          ]),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton(
+              onPressed: () => showDialog(
+                context: context,
+                builder: (_) => ResearchDialog(gs: _gs, onChanged: () => setState(() {})),
+              ),
+              style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: Color(0xFF00DDCC)),
+                shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+                padding: const EdgeInsets.symmetric(vertical: 8),
+              ),
+              child: const Text('RESEARCH TERMINAL',
+                  style: TextStyle(fontSize: 8, letterSpacing: 2, color: Color(0xFF00DDCC), fontWeight: FontWeight.bold)),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -796,48 +813,23 @@ class _GalaxyMapScreenState extends State<GalaxyMapScreen>
   Widget _buildCrewPanel() {
     final alive = _gs.crew.where((c) => c.isAlive).toList();
     return _Panel(
-      title: 'CREW MANIFEST',
+      title: 'CREW MANIFEST  •  TAP TO INTERACT',
       child: Column(
         children: alive.map((c) {
-          final isCitizen = c.status == CrewStatus.citizen;
-          final sColor = isCitizen
+          final sColor = c.status == CrewStatus.citizen
               ? const Color(0xFF00AAFF)
               : const Color(0xFFFFAA00);
-          return Padding(
-            padding: const EdgeInsets.only(bottom: 10),
-            child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(children: [
-                    Expanded(
-                      child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(c.name,
-                                style: const TextStyle(
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.bold)),
-                            Text(c.role,
-                                style: TextStyle(
-                                    fontSize: 9,
-                                    color: Colors.white.withAlpha(120))),
-                          ]),
-                    ),
-                    _Badge(label: c.statusLabel, color: sColor),
-                  ]),
-                  const SizedBox(height: 4),
-                  Row(children: [
-                    Expanded(
-                        child: _MiniBar(
-                            value: c.loyalty / 100,
-                            color: const Color(0xFF00FF88))),
-                    const SizedBox(width: 6),
-                    Text(c.loyaltyLabel,
-                        style: TextStyle(
-                            fontSize: 8,
-                            color: Colors.white.withAlpha(120))),
-                  ]),
-                ]),
+          return _CrewCard(
+            member: c,
+            statusColor: sColor,
+            onTap: () => showDialog(
+              context: context,
+              builder: (_) => CrewProfileDialog(
+                member: c,
+                gs: _gs,
+                onChanged: () => setState(() {}),
+              ),
+            ),
           );
         }).toList(),
       ),
@@ -900,6 +892,7 @@ class GalaxyMapPainter extends CustomPainter {
   final String currentSystemId;
   final Set<String> visitedIds;
   final Set<String> blockedConnections;
+  final Set<String> eventConnections;
   final Offset shipNormPos;
   final double pulseValue;
 
@@ -908,12 +901,15 @@ class GalaxyMapPainter extends CustomPainter {
     required this.currentSystemId,
     required this.visitedIds,
     required this.blockedConnections,
+    required this.eventConnections,
     required this.shipNormPos,
     required this.pulseValue,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
+    _drawNebulae(canvas, size);
+    _drawSectorZones(canvas, size);
     _drawConnections(canvas, size);
 
     final current = systems.firstWhere((s) => s.id == currentSystemId);
@@ -923,14 +919,64 @@ class GalaxyMapPainter extends CustomPainter {
       _drawNode(canvas, sys, size, reachable);
     }
 
-    final shipPixel =
-        Offset(shipNormPos.dx * size.width, shipNormPos.dy * size.height);
+    final shipPixel = Offset(shipNormPos.dx * size.width, shipNormPos.dy * size.height);
     _drawShip(canvas, shipPixel);
   }
 
+  // Painted nebula clouds for galaxy atmosphere
+  void _drawNebulae(Canvas canvas, Size size) {
+    void nebula(double nx, double ny, double radius, Color color, int alpha) {
+      canvas.drawCircle(
+        Offset(nx * size.width, ny * size.height),
+        radius,
+        Paint()
+          ..color = color.withAlpha(alpha)
+          ..maskFilter = MaskFilter.blur(BlurStyle.normal, radius * 0.6),
+      );
+    }
+    // Blue-purple nebula — upper center (around graveyard/sector 3)
+    nebula(0.50, 0.10, size.width * 0.10, const Color(0xFF4444FF), 28);
+    nebula(0.48, 0.20, size.width * 0.07, const Color(0xFF8844FF), 18);
+    // Red-orange nebula — lower center (deadzone area)
+    nebula(0.50, 0.88, size.width * 0.10, const Color(0xFFFF4422), 22);
+    nebula(0.53, 0.80, size.width * 0.06, const Color(0xFFFF8800), 15);
+    // Cyan nebula — far right (approaching accordprime)
+    nebula(0.90, 0.30, size.width * 0.07, const Color(0xFF00DDCC), 20);
+    nebula(0.88, 0.68, size.width * 0.07, const Color(0xFF0088FF), 18);
+    // Faint galaxy core glow — center of map
+    nebula(0.50, 0.50, size.width * 0.15, const Color(0xFF223344), 30);
+  }
+
+  // Very faint vertical bands showing sector boundaries
+  void _drawSectorZones(Canvas canvas, Size size) {
+    final cols = [0.17, 0.38, 0.63, 0.84]; // midpoints between sector columns
+    final paint = Paint()
+      ..color = Colors.white.withAlpha(8)
+      ..strokeWidth = 1
+      ..style = PaintingStyle.stroke;
+    for (final x in cols) {
+      canvas.drawLine(
+        Offset(x * size.width, 0),
+        Offset(x * size.width, size.height),
+        paint,
+      );
+    }
+    // Sector labels along bottom
+    for (int i = 1; i <= 5; i++) {
+      final cx = switch (i) {
+        1 => 0.07, 2 => 0.27, 3 => 0.50, 4 => 0.75, _ => 0.93,
+      };
+      _paintText(canvas, Offset(cx * size.width, size.height - 8),
+          'SEC $i', size: 7, color: Colors.white.withAlpha(22));
+    }
+  }
+
   void _drawConnections(Canvas canvas, Size size) {
+    final glowPaint = Paint()
+      ..strokeWidth = 8
+      ..style = PaintingStyle.stroke;
     final normalPaint = Paint()
-      ..color = Colors.white.withAlpha(22)
+      ..color = Colors.white.withAlpha(30)
       ..strokeWidth = 1
       ..style = PaintingStyle.stroke;
     final blockedPaint = Paint()
@@ -944,18 +990,49 @@ class GalaxyMapPainter extends CustomPainter {
         final key = ([sys.id, connId]..sort()).join('-');
         if (drawn.contains(key)) continue;
         drawn.add(key);
-        final conn =
-            systems.firstWhere((s) => s.id == connId, orElse: () => sys);
+        final conn = systems.firstWhere((s) => s.id == connId, orElse: () => sys);
         final from = sys.pixelPos(size);
-        final to = conn.pixelPos(size);
+        final to   = conn.pixelPos(size);
 
         if (blockedConnections.contains(key)) {
           _drawDashed(canvas, from, to, blockedPaint);
         } else {
+          // Subtle glow behind the line
+          glowPaint.color = Colors.white.withAlpha(5);
+          canvas.drawLine(from, to, glowPaint);
           canvas.drawLine(from, to, normalPaint);
+
+          // Event marker diamonds along the path
+          if (eventConnections.contains(key)) {
+            final mid = Offset.lerp(from, to, 0.5)!;
+            _drawEventDiamond(canvas, mid);
+          }
         }
       }
     }
+  }
+
+  void _drawEventDiamond(Canvas canvas, Offset center) {
+    const r = 5.0;
+    final path = Path()
+      ..moveTo(center.dx, center.dy - r)
+      ..lineTo(center.dx + r, center.dy)
+      ..lineTo(center.dx, center.dy + r)
+      ..lineTo(center.dx - r, center.dy)
+      ..close();
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = const Color(0xFFFFDD44).withAlpha(60)
+        ..style = PaintingStyle.fill,
+    );
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = const Color(0xFFFFDD44).withAlpha(160)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1,
+    );
   }
 
   void _drawDashed(Canvas canvas, Offset from, Offset to, Paint paint) {
@@ -974,140 +1051,115 @@ class GalaxyMapPainter extends CustomPainter {
     }
   }
 
-  void _drawNode(
-      Canvas canvas, StarSystem sys, Size size, Set<String> reachable) {
+  void _drawNode(Canvas canvas, StarSystem sys, Size size, Set<String> reachable) {
     final pos = sys.pixelPos(size);
-    final isCurrent = sys.id == currentSystemId;
+    final isCurrent   = sys.id == currentSystemId;
     final isReachable = reachable.contains(sys.id);
-    final isVisited = visitedIds.contains(sys.id);
-    final isFinal = sys.id == 'accordprime';
+    final isVisited   = visitedIds.contains(sys.id);
+    final isFinal     = sys.id == 'accordprime';
     final color = isFinal ? const Color(0xFFCC88FF) : _typeColor(sys.type);
 
-    // Shop ring
+    // accordprime elaborate glow
+    if (isFinal) {
+      for (double r = 35; r >= 10; r -= 8) {
+        canvas.drawCircle(pos, r,
+          Paint()
+            ..color = color.withAlpha((pulseValue * 30 + 10).round())
+            ..maskFilter = MaskFilter.blur(BlurStyle.normal, r * 0.5),
+        );
+      }
+    }
+
+    // Shop orbit ring
     if (sys.isShop) {
-      canvas.drawCircle(
-        pos,
-        14,
+      canvas.drawCircle(pos, isFinal ? 18 : 14,
         Paint()
-          ..color = const Color(0xFF00DDCC).withAlpha(isCurrent ? 80 : 40)
+          ..color = const Color(0xFF00DDCC).withAlpha(isCurrent ? 100 : 45)
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1.5,
       );
     }
 
-    // Pulse ring on reachable systems
+    // Pulse ring on reachable
     if (isReachable) {
-      canvas.drawCircle(
-        pos,
-        22 + pulseValue * 5,
+      canvas.drawCircle(pos, 22 + pulseValue * 5,
         Paint()
-          ..color = color.withAlpha((45 + pulseValue * 55).round())
+          ..color = color.withAlpha((40 + pulseValue * 60).round())
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1.5,
       );
     }
 
-    // Glow on current system
+    // Current system glow
     if (isCurrent) {
-      canvas.drawCircle(
-        pos,
-        16,
+      canvas.drawCircle(pos, 18,
         Paint()
-          ..color = color.withAlpha(50)
-          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10),
+          ..color = color.withAlpha(55)
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12),
       );
     }
 
-    final radius = isCurrent ? 10.0 : 8.0;
+    final radius = isFinal ? 12.0 : isCurrent ? 10.0 : 8.0;
     final fillColor = isCurrent
         ? color
-        : isVisited
-            ? color.withAlpha(160)
-            : color.withAlpha(70);
+        : isVisited ? color.withAlpha(160) : color.withAlpha(65);
 
+    canvas.drawCircle(pos, radius, Paint()..color = fillColor..style = PaintingStyle.fill);
     canvas.drawCircle(pos, radius,
-        Paint()..color = fillColor..style = PaintingStyle.fill);
-    canvas.drawCircle(
-      pos,
-      radius,
       Paint()
         ..color = isCurrent ? Colors.white : color.withAlpha(180)
         ..style = PaintingStyle.stroke
         ..strokeWidth = isCurrent ? 2 : 1,
     );
 
+    // Inner star shape for jumpgate
+    if (sys.type == StarSystemType.jumpgate) {
+      _paintText(canvas, pos, '✦', size: 9, color: Colors.white.withAlpha(180));
+    }
+
     // Name label
-    _paintText(
-      canvas,
-      pos.translate(0, 16),
-      sys.name.toUpperCase(),
+    _paintText(canvas, pos.translate(0, radius + 8), sys.name.toUpperCase(),
       size: 8.5,
-      color: isCurrent
-          ? Colors.white
-          : isReachable
-              ? color
-              : Colors.white.withAlpha(80),
+      color: isCurrent ? Colors.white : isReachable ? color : Colors.white.withAlpha(75),
       bold: isCurrent,
     );
 
-    // Sector hint for reachable/current
+    // Sub-labels
     if (isCurrent || isReachable) {
-      _paintText(
-        canvas,
-        pos.translate(0, 27),
-        'SECTOR ${sys.sector}',
-        size: 7,
-        color: Colors.white.withAlpha(60),
-      );
+      _paintText(canvas, pos.translate(0, radius + 19), 'SECTOR ${sys.sector}',
+        size: 7, color: Colors.white.withAlpha(55));
+      if (sys.isShop) {
+        _paintText(canvas, pos.translate(0, radius + 29), '[ TRADE ]',
+          size: 7, color: const Color(0xFF00DDCC).withAlpha(180));
+      }
     }
 
-    // Shop label
-    if (sys.isShop && (isCurrent || isReachable)) {
-      _paintText(
-        canvas,
-        pos.translate(0, 36),
-        '[ TRADE ]',
-        size: 7,
-        color: const Color(0xFF00DDCC).withAlpha(180),
-      );
-    }
-
-    // NPC dot (unvisited systems with NPCs)
+    // NPC dot
     if (sys.hasNpc && !isVisited) {
-      canvas.drawCircle(
-        pos.translate(13, -13),
-        4,
-        Paint()..color = const Color(0xFFFFDD44),
-      );
+      canvas.drawCircle(pos.translate(radius + 3, -(radius + 3)), 4,
+        Paint()..color = const Color(0xFFFFDD44));
     }
   }
 
   void _drawShip(Canvas canvas, Offset pos) {
     const color = Color(0xFF00FF88);
-
     // Engine glow
-    canvas.drawCircle(
-      pos,
-      12,
+    canvas.drawCircle(pos, 14,
       Paint()
-        ..color = color.withAlpha(35)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 9),
+        ..color = color.withAlpha(40)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10),
     );
-
-    // Ship chevron
+    // Chevron
     final path = Path()
       ..moveTo(pos.dx, pos.dy - 9)
       ..lineTo(pos.dx + 5, pos.dy + 5)
       ..lineTo(pos.dx, pos.dy + 2)
       ..lineTo(pos.dx - 5, pos.dy + 5)
       ..close();
-
+    canvas.drawPath(path, Paint()..color = color..style = PaintingStyle.fill);
     canvas.drawPath(path,
-        Paint()..color = color..style = PaintingStyle.fill);
-    canvas.drawPath(
-      path,
       Paint()
-        ..color = Colors.white.withAlpha(180)
+        ..color = Colors.white.withAlpha(200)
         ..style = PaintingStyle.stroke
         ..strokeWidth = 0.8,
     );
@@ -1117,23 +1169,25 @@ class GalaxyMapPainter extends CustomPainter {
       {required double size, required Color color, bool bold = false}) {
     final tp = TextPainter(
       text: TextSpan(
-          text: text,
-          style: TextStyle(
-              fontSize: size,
-              color: color,
-              letterSpacing: 1,
-              fontWeight: bold ? FontWeight.bold : FontWeight.normal)),
+        text: text,
+        style: TextStyle(
+          fontSize: size,
+          color: color,
+          letterSpacing: 1,
+          fontWeight: bold ? FontWeight.bold : FontWeight.normal,
+        ),
+      ),
       textDirection: TextDirection.ltr,
     )..layout();
-    tp.paint(canvas, center.translate(-tp.width / 2, 0));
+    tp.paint(canvas, center.translate(-tp.width / 2, -tp.height / 2));
   }
 
   Color _typeColor(StarSystemType type) => switch (type) {
-        StarSystemType.station => const Color(0xFF00AAFF),
-        StarSystemType.planet => const Color(0xFF00FF88),
-        StarSystemType.debris => const Color(0xFFFFAA00),
-        StarSystemType.jumpgate => const Color(0xFFCC88FF),
-      };
+    StarSystemType.station  => const Color(0xFF00AAFF),
+    StarSystemType.planet   => const Color(0xFF00FF88),
+    StarSystemType.debris   => const Color(0xFFFFAA00),
+    StarSystemType.jumpgate => const Color(0xFFCC88FF),
+  };
 
   @override
   bool shouldRepaint(GalaxyMapPainter old) =>
@@ -1631,11 +1685,14 @@ class _StatBar extends StatelessWidget {
   final int value;
   final int max;
   final Color color;
-  const _StatBar(
-      {required this.label,
-      required this.value,
-      required this.max,
-      required this.color});
+  final String note;
+  const _StatBar({
+    required this.label,
+    required this.value,
+    required this.max,
+    required this.color,
+    this.note = '',
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1651,6 +1708,13 @@ class _StatBar extends StatelessWidget {
                     letterSpacing: 2,
                     color: Colors.white.withAlpha(140))),
             const Spacer(),
+            if (note.isNotEmpty)
+              Text(note,
+                  style: TextStyle(
+                      fontSize: 8,
+                      letterSpacing: 1,
+                      color: color.withAlpha(180))),
+            const SizedBox(width: 5),
             Text('$value',
                 style: TextStyle(
                     fontSize: 9, color: Colors.white.withAlpha(100))),
@@ -1786,6 +1850,165 @@ class _SectorDots extends StatelessWidget {
           ),
         );
       }),
+    );
+  }
+}
+
+// ─── Crew Card (tappable) ─────────────────────────────────────────────────────
+
+class _CrewCard extends StatefulWidget {
+  final CrewMember member;
+  final Color statusColor;
+  final VoidCallback onTap;
+  const _CrewCard({required this.member, required this.statusColor, required this.onTap});
+
+  @override
+  State<_CrewCard> createState() => _CrewCardState();
+}
+
+class _CrewCardState extends State<_CrewCard> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.member;
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          margin: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            border: Border.all(
+              color: _hovered ? const Color(0xFF00FF88).withAlpha(160) : Colors.white.withAlpha(18),
+            ),
+            color: _hovered ? const Color(0xFF00FF88).withAlpha(8) : Colors.transparent,
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(c.name, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                  Text(
+                    c.assignedDuty != null ? '${c.role}  •  ${c.assignedDuty!.label}' : c.role,
+                    style: TextStyle(fontSize: 9, color: Colors.white.withAlpha(110)),
+                  ),
+                ]),
+              ),
+              _Badge(label: c.statusLabel, color: widget.statusColor),
+              const SizedBox(width: 4),
+              Icon(Icons.chevron_right, size: 13, color: Colors.white.withAlpha(_hovered ? 160 : 50)),
+            ]),
+            const SizedBox(height: 5),
+            Row(children: [
+              Expanded(child: _MiniBar(value: c.loyalty / 100, color: const Color(0xFF00FF88))),
+              const SizedBox(width: 6),
+              Text(c.loyaltyLabel, style: TextStyle(fontSize: 8, color: Colors.white.withAlpha(110))),
+            ]),
+            if (c.trauma > 20)
+              Padding(
+                padding: const EdgeInsets.only(top: 3),
+                child: Text('⚠ Trauma ${c.trauma}%', style: const TextStyle(fontSize: 8, color: Color(0xFFFF8844))),
+              ),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+// ─── Path Event Dialog ────────────────────────────────────────────────────────
+
+class _PathEventDialog extends StatelessWidget {
+  final PathEvent event;
+  final VoidCallback onContinue;
+  const _PathEventDialog({required this.event, required this.onContinue});
+
+  @override
+  Widget build(BuildContext context) {
+    final isHazard = event.type == PathEventType.hazard;
+    final isBonus  = event.type == PathEventType.bonus;
+    final accent   = isBonus  ? const Color(0xFF00FF88)
+                   : isHazard ? const Color(0xFFFF5544)
+                              : const Color(0xFF00AAFF);
+    final icon = isBonus ? '◈' : isHazard ? '⚠' : '◉';
+
+    final deltas = <(String, int)>[];
+    if (event.hullDelta    != 0) deltas.add(('Hull',     event.hullDelta));
+    if (event.fuelDelta    != 0) deltas.add(('Fuel',     event.fuelDelta));
+    if (event.rationsDelta != 0) deltas.add(('Rations',  event.rationsDelta));
+    if (event.oxygenDelta  != 0) deltas.add(('O2',       event.oxygenDelta));
+    if (event.creditsDelta != 0) deltas.add(('Credits',  event.creditsDelta));
+    if (event.ammoDelta    != 0) deltas.add(('Ammo',     event.ammoDelta));
+    if (event.medicineDelta!= 0) deltas.add(('Medicine', event.medicineDelta));
+    if (event.loyaltyDelta != 0) deltas.add(('Loyalty',  event.loyaltyDelta));
+    if (event.fearDelta    != 0) deltas.add(('Fear',     event.fearDelta));
+
+    return Dialog(
+      backgroundColor: const Color(0xFF040814),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+      insetPadding: const EdgeInsets.all(32),
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: 480),
+        padding: const EdgeInsets.all(28),
+        decoration: BoxDecoration(border: Border.all(color: accent.withAlpha(140))),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              Text(icon, style: TextStyle(fontSize: 14, color: accent)),
+              const SizedBox(width: 10),
+              Text(
+                isBonus ? 'TRANSIT EVENT  •  DISCOVERY' : isHazard ? 'TRANSIT EVENT  •  HAZARD' : 'TRANSIT EVENT  •  INTEL',
+                style: TextStyle(fontSize: 8, letterSpacing: 3, color: accent),
+              ),
+            ]),
+            const SizedBox(height: 10),
+            Text(event.title, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w900, letterSpacing: 2)),
+            const SizedBox(height: 14),
+            Container(height: 1, color: accent.withAlpha(50)),
+            const SizedBox(height: 14),
+            Text(event.flavor, style: const TextStyle(fontSize: 12, height: 1.7)),
+            if (deltas.isNotEmpty) ...[
+              const SizedBox(height: 16),
+              Wrap(
+                spacing: 7,
+                runSpacing: 6,
+                children: deltas.map((d) {
+                  final pos = d.$2 > 0;
+                  final isBadPositive = d.$1 == 'Fear';
+                  final good = pos != isBadPositive;
+                  final c2 = good ? const Color(0xFF00FF88) : const Color(0xFFFF5544);
+                  return Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                    decoration: BoxDecoration(border: Border.all(color: c2.withAlpha(120)), color: c2.withAlpha(15)),
+                    child: Text('${d.$1}  ${pos ? "+" : ""}${d.$2}',
+                        style: TextStyle(fontSize: 9, letterSpacing: 1, color: c2)),
+                  );
+                }).toList(),
+              ),
+            ],
+            const SizedBox(height: 22),
+            Align(
+              alignment: Alignment.centerRight,
+              child: OutlinedButton(
+                onPressed: onContinue,
+                style: OutlinedButton.styleFrom(
+                  side: BorderSide(color: accent),
+                  shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+                  padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
+                ),
+                child: Text('CONTINUE  →',
+                    style: TextStyle(letterSpacing: 3, color: accent, fontWeight: FontWeight.bold)),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
